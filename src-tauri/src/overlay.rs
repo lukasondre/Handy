@@ -31,8 +31,16 @@ tauri_panel! {
     })
 }
 
-const OVERLAY_WIDTH: f64 = 172.0;
-const OVERLAY_HEIGHT: f64 = 36.0;
+/// Minimum width of the overlay window. When no monitor is detected the window
+/// falls back to this value.
+const OVERLAY_MIN_WIDTH: f64 = 172.0;
+
+/// The visual height of the small recording-indicator pill at the edge of the screen.
+const OVERLAY_INDICATOR_HEIGHT: f64 = 36.0;
+
+/// Total window height. The window is transparent, so the area above the indicator
+/// pill is invisible until the transcription bubble appears.
+const OVERLAY_HEIGHT: f64 = 250.0;
 
 #[cfg(target_os = "macos")]
 const OVERLAY_TOP_OFFSET: f64 = 46.0;
@@ -200,7 +208,12 @@ fn is_mouse_within_monitor(
 /// We must use LogicalPosition (not PhysicalPosition) because Tauri/tao
 /// converts PhysicalPosition using the scale factor of the monitor the window
 /// is *currently* on, which is wrong when moving cross-monitor.
-fn calculate_overlay_position(app_handle: &AppHandle) -> Option<(f64, f64)> {
+/// Returns `(x, y, width, height)` in logical coordinates for the overlay window.
+///
+/// Width is 50% of the monitor width so the transcription bubble has room to grow.
+/// The window is transparent, so any unused vertical space above/below the pills is
+/// invisible to the user.
+fn calculate_overlay_position(app_handle: &AppHandle) -> Option<(f64, f64, f64, f64)> {
     let monitor = get_monitor_with_cursor(app_handle)?;
     let scale = monitor.scale_factor();
     let monitor_x = monitor.position().x as f64 / scale;
@@ -210,15 +223,20 @@ fn calculate_overlay_position(app_handle: &AppHandle) -> Option<(f64, f64)> {
 
     let settings = settings::get_settings(app_handle);
 
-    let x = monitor_x + (monitor_width - OVERLAY_WIDTH) / 2.0;
+    let overlay_width = (monitor_width * 0.5).round().max(OVERLAY_MIN_WIDTH);
+
+    let x = monitor_x + (monitor_width - overlay_width) / 2.0;
     let y = match settings.overlay_position {
         OverlayPosition::Top => monitor_y + OVERLAY_TOP_OFFSET,
         OverlayPosition::Bottom | OverlayPosition::None => {
-            monitor_y + monitor_height - OVERLAY_HEIGHT - OVERLAY_BOTTOM_OFFSET
+            // Anchor the bottom of the window at the same position the old small
+            // indicator bottom sat, so the indicator pill stays in place visually.
+            monitor_y + monitor_height - OVERLAY_INDICATOR_HEIGHT - OVERLAY_BOTTOM_OFFSET
+                - (OVERLAY_HEIGHT - OVERLAY_INDICATOR_HEIGHT)
         }
     };
 
-    Some((x, y))
+    Some((x, y, overlay_width, OVERLAY_HEIGHT))
 }
 
 /// Creates the recording overlay window and keeps it hidden by default
@@ -235,6 +253,10 @@ pub fn create_recording_overlay(app_handle: &AppHandle) {
         }
     }
 
+    let (overlay_width, overlay_height) = calculate_overlay_position(app_handle)
+        .map(|(_, _, w, h)| (w, h))
+        .unwrap_or((OVERLAY_MIN_WIDTH, OVERLAY_HEIGHT));
+
     // Position starts unset — update_overlay_position() sets the correct
     // LogicalPosition before the overlay is shown.
     let mut builder = WebviewWindowBuilder::new(
@@ -244,7 +266,7 @@ pub fn create_recording_overlay(app_handle: &AppHandle) {
     )
     .title("Recording")
     .resizable(false)
-    .inner_size(OVERLAY_WIDTH, OVERLAY_HEIGHT)
+    .inner_size(overlay_width, overlay_height)
     .shadow(false)
     .maximizable(false)
     .minimizable(false)
@@ -285,7 +307,7 @@ pub fn create_recording_overlay(app_handle: &AppHandle) {
 /// Creates the recording overlay panel and keeps it hidden by default (macOS)
 #[cfg(target_os = "macos")]
 pub fn create_recording_overlay(app_handle: &AppHandle) {
-    if let Some((x, y)) = calculate_overlay_position(app_handle) {
+    if let Some((x, y, overlay_width, overlay_height)) = calculate_overlay_position(app_handle) {
         // PanelBuilder creates a Tauri window then converts it to NSPanel.
         // The window remains registered, so get_webview_window() still works.
         match PanelBuilder::<_, RecordingOverlayPanel>::new(app_handle, "recording_overlay")
@@ -294,8 +316,8 @@ pub fn create_recording_overlay(app_handle: &AppHandle) {
             .position(tauri::Position::Logical(tauri::LogicalPosition { x, y }))
             .level(PanelLevel::Status)
             .size(tauri::Size::Logical(tauri::LogicalSize {
-                width: OVERLAY_WIDTH,
-                height: OVERLAY_HEIGHT,
+                width: overlay_width,
+                height: overlay_height,
             }))
             .has_shadow(false)
             .transparent(true)
@@ -319,6 +341,13 @@ pub fn create_recording_overlay(app_handle: &AppHandle) {
     }
 }
 
+#[derive(serde::Serialize, Clone)]
+struct ShowOverlayPayload {
+    state: String,
+    /// "top" or "bottom" — tells the frontend which edge to anchor the indicator to.
+    position: String,
+}
+
 fn show_overlay_state(app_handle: &AppHandle, state: &str) {
     // Check if overlay should be shown based on position setting
     let settings = settings::get_settings(app_handle);
@@ -335,7 +364,17 @@ fn show_overlay_state(app_handle: &AppHandle, state: &str) {
         #[cfg(target_os = "windows")]
         force_overlay_topmost(&overlay_window);
 
-        let _ = overlay_window.emit("show-overlay", state);
+        let position = match settings.overlay_position {
+            OverlayPosition::Top => "top",
+            _ => "bottom",
+        };
+        let _ = overlay_window.emit(
+            "show-overlay",
+            ShowOverlayPayload {
+                state: state.to_string(),
+                position: position.to_string(),
+            },
+        );
     }
 }
 
@@ -362,7 +401,7 @@ pub fn update_overlay_position(app_handle: &AppHandle) {
             update_gtk_layer_shell_anchors(&overlay_window);
         }
 
-        if let Some((x, y)) = calculate_overlay_position(app_handle) {
+        if let Some((x, y, _, _)) = calculate_overlay_position(app_handle) {
             let _ = overlay_window
                 .set_position(tauri::Position::Logical(tauri::LogicalPosition { x, y }));
         }

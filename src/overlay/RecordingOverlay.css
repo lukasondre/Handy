@@ -1,3 +1,38 @@
+/* ── Root wrapper fills the entire transparent window ─────────────────────── */
+
+.overlay-root {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  box-sizing: border-box;
+  /* Hidden until show-overlay fires */
+  opacity: 0;
+  transition: opacity 300ms ease-out;
+  pointer-events: none;
+}
+
+.overlay-root--visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* Bottom position: anchor content to the bottom edge of the window.
+   Order in JSX: [bubble, indicator] → bubble floats above indicator. */
+.overlay-root--bottom {
+  justify-content: flex-end;
+}
+
+/* Top position: anchor content to the top edge of the window.
+   Order in JSX: [indicator, bubble] → bubble hangs below indicator. */
+.overlay-root--top {
+  justify-content: flex-start;
+}
+
+/* ── Small recording-indicator pill ───────────────────────────────────────── */
+
 .recording-overlay {
   height: 36px;
   width: 172px;
@@ -7,9 +42,8 @@
   padding: 6px;
   background: #000000cc;
   border-radius: 18px;
-  opacity: 0;
-  transition: opacity 300ms ease-out;
   box-sizing: border-box;
+  flex-shrink: 0;
 }
 
 .overlay-left {
@@ -34,7 +68,6 @@
   align-items: end;
   justify-content: center;
   gap: 3px;
-  padding-bottom: 0px;
   height: 24px;
   overflow: hidden;
 }
@@ -46,10 +79,6 @@
   border-radius: 2px;
   transition: height 80ms linear;
   min-height: 4px;
-}
-
-.recording-overlay.fade-in {
-  opacity: 1;
 }
 
 .transcribing-text {
@@ -92,4 +121,24 @@
 
 .cancel-button:active {
   transform: scale(0.95);
+}
+
+/* ── Live transcription bubble ────────────────────────────────────────────── */
+
+.transcription-bubble {
+  width: 100%; /* fills the 50%-screen-wide window */
+  box-sizing: border-box;
+  background: #000000cc;
+  border-radius: 14px;
+  padding: 10px 14px;
+  color: rgba(255, 255, 255, 0.9);
+  font-size: 13px;
+  line-height: 1.5;
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  word-break: break-word;
+  overflow-wrap: break-word;
+  /* Scrollable if text somehow overflows the window */
+  overflow-y: auto;
+  max-height: 200px;
 }

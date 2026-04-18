@@ -4,7 +4,7 @@ use crate::settings::{get_settings, AppSettings};
 use crate::utils;
 use log::{debug, error, info};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::Manager;
 
@@ -153,6 +153,14 @@ pub struct AudioRecordingManager {
     is_recording: Arc<Mutex<bool>>,
     did_mute: Arc<Mutex<bool>>,
     close_generation: Arc<AtomicU64>,
+
+    /// Receives speech segments emitted by the audio worker during recording.
+    /// Consumed by the background live-transcription task in actions.rs.
+    segment_rx: Arc<Mutex<Option<mpsc::Receiver<Vec<f32>>>>>,
+    /// Transcription text accumulated from segments processed so far in this recording.
+    partial_transcription: Arc<Mutex<String>>,
+    /// Handle for the background segment-transcription thread.
+    segment_task_handle: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
 }
 
 impl AudioRecordingManager {
@@ -176,6 +184,10 @@ impl AudioRecordingManager {
             is_recording: Arc::new(Mutex::new(false)),
             did_mute: Arc::new(Mutex::new(false)),
             close_generation: Arc::new(AtomicU64::new(0)),
+
+            segment_rx: Arc::new(Mutex::new(None)),
+            partial_transcription: Arc::new(Mutex::new(String::new())),
+            segment_task_handle: Arc::new(Mutex::new(None)),
         };
 
         // Always-on?  Open immediately.
@@ -343,7 +355,7 @@ impl AudioRecordingManager {
         if let Some(rec) = self.recorder.lock().unwrap().as_mut() {
             // If still recording, stop first.
             if *self.is_recording.lock().unwrap() {
-                let _ = rec.stop();
+                let _ = rec.stop(); // returns (Vec<f32>, usize), result intentionally discarded
                 *self.is_recording.lock().unwrap() = false;
             }
             let _ = rec.close();
@@ -393,7 +405,16 @@ impl AudioRecordingManager {
                 }
             }
 
+            // Create a fresh segment channel for this recording session.
+            let (seg_tx, seg_rx) = mpsc::sync_channel::<Vec<f32>>(20);
+            *self.segment_rx.lock().unwrap() = Some(seg_rx);
+
             if let Some(rec) = self.recorder.lock().unwrap().as_ref() {
+                // Wire the segment sender into the audio worker before starting.
+                if let Err(e) = rec.set_segment_sender(Some(seg_tx)) {
+                    debug!("Failed to set segment sender: {}", e);
+                    // Non-fatal: live transcription won't work but recording continues.
+                }
                 if rec.start().is_ok() {
                     *self.is_recording.lock().unwrap() = true;
                     *state = RecordingState::Recording {
@@ -419,7 +440,11 @@ impl AudioRecordingManager {
         Ok(())
     }
 
-    pub fn stop_recording(&self, binding_id: &str) -> Option<Vec<f32>> {
+    /// Stop recording and return `(all_samples, emitted_count)` where:
+    /// - `all_samples` is the complete VAD-filtered audio (use for WAV saving),
+    /// - `emitted_count` is the number of samples already dispatched as live
+    ///   segments; `all_samples[emitted_count..]` is the un-transcribed tail.
+    pub fn stop_recording(&self, binding_id: &str) -> Option<(Vec<f32>, usize)> {
         let mut state = self.state.lock().unwrap();
 
         match *state {
@@ -439,18 +464,19 @@ impl AudioRecordingManager {
                     std::thread::sleep(Duration::from_millis(settings.extra_recording_buffer_ms));
                 }
 
-                let samples = if let Some(rec) = self.recorder.lock().unwrap().as_ref() {
-                    match rec.stop() {
-                        Ok(buf) => buf,
-                        Err(e) => {
-                            error!("stop() failed: {e}");
-                            Vec::new()
+                let (mut all_samples, emitted_count) =
+                    if let Some(rec) = self.recorder.lock().unwrap().as_ref() {
+                        match rec.stop() {
+                            Ok(buf) => buf,
+                            Err(e) => {
+                                error!("stop() failed: {e}");
+                                (Vec::new(), 0)
+                            }
                         }
-                    }
-                } else {
-                    error!("Recorder not available");
-                    Vec::new()
-                };
+                    } else {
+                        error!("Recorder not available");
+                        (Vec::new(), 0)
+                    };
 
                 *self.is_recording.lock().unwrap() = false;
 
@@ -464,15 +490,12 @@ impl AudioRecordingManager {
                 }
 
                 // Pad if very short
-                let s_len = samples.len();
-                // debug!("Got {} samples", s_len);
+                let s_len = all_samples.len();
                 if s_len < WHISPER_SAMPLE_RATE && s_len > 0 {
-                    let mut padded = samples;
-                    padded.resize(WHISPER_SAMPLE_RATE * 5 / 4, 0.0);
-                    Some(padded)
-                } else {
-                    Some(samples)
+                    all_samples.resize(WHISPER_SAMPLE_RATE * 5 / 4, 0.0);
                 }
+
+                Some((all_samples, emitted_count))
             }
             _ => None,
         }
@@ -493,10 +516,13 @@ impl AudioRecordingManager {
             drop(state);
 
             if let Some(rec) = self.recorder.lock().unwrap().as_ref() {
-                let _ = rec.stop(); // Discard the result
+                let _ = rec.stop(); // returns (Vec<f32>, usize), result intentionally discarded
             }
 
             *self.is_recording.lock().unwrap() = false;
+
+            // Clear any partial transcription from this cancelled recording.
+            self.clear_partial_transcription();
 
             // In on-demand mode, close the mic (lazily if the setting is enabled)
             if matches!(*self.mode.lock().unwrap(), MicrophoneMode::OnDemand) {
@@ -506,6 +532,49 @@ impl AudioRecordingManager {
                     self.stop_microphone_stream();
                 }
             }
+        }
+    }
+
+    /* ---------- live transcription helpers ---------------------------------- */
+
+    /// Take the segment receiver for the current recording. May only be called
+    /// once per recording; subsequent calls return `None`.
+    pub fn take_segment_receiver(&self) -> Option<mpsc::Receiver<Vec<f32>>> {
+        self.segment_rx.lock().unwrap().take()
+    }
+
+    pub fn get_partial_transcription(&self) -> String {
+        self.partial_transcription.lock().unwrap().clone()
+    }
+
+    pub fn append_partial_transcription(&self, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let mut partial = self.partial_transcription.lock().unwrap();
+        if !partial.is_empty() {
+            partial.push(' ');
+        }
+        partial.push_str(text);
+    }
+
+    pub fn clear_partial_transcription(&self) {
+        self.partial_transcription.lock().unwrap().clear();
+    }
+
+    pub fn set_segment_task_handle(&self, handle: std::thread::JoinHandle<()>) {
+        *self.segment_task_handle.lock().unwrap() = Some(handle);
+    }
+
+    /// Wait for the background segment-transcription task to finish. This
+    /// blocks until all queued segments have been transcribed. The segment
+    /// sender is dropped by the audio worker on `Cmd::Stop`, so the task exits
+    /// naturally once it has drained the channel.
+    pub fn join_segment_task(&self) {
+        let handle = self.segment_task_handle.lock().unwrap().take();
+        if let Some(h) = handle {
+            let _ = h.join();
         }
     }
 }

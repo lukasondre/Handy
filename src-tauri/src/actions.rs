@@ -340,6 +340,17 @@ async fn maybe_convert_chinese_variant(
     }
 }
 
+/// Join partial (from live segments) and tail (from final stop) into one string.
+fn combine_transcriptions(partial: &str, tail: &str) -> String {
+    let partial = partial.trim();
+    let tail = tail.trim();
+    match (partial.is_empty(), tail.is_empty()) {
+        (true, _) => tail.to_string(),
+        (_, true) => partial.to_string(),
+        _ => format!("{partial} {tail}"),
+    }
+}
+
 pub(crate) struct ProcessedTranscription {
     pub final_text: String,
     pub post_processed_text: Option<String>,
@@ -458,6 +469,28 @@ impl ShortcutAction for TranscribeAction {
         }
 
         if recording_error.is_none() {
+            // Spawn background task that transcribes each speech segment emitted
+            // by the VAD during recording, accumulating partial text in real-time.
+            rm.clear_partial_transcription();
+            if let Some(seg_rx) = rm.take_segment_receiver() {
+                let tm_bg = Arc::clone(&tm);
+                let rm_bg = Arc::clone(&rm);
+                let app_bg = app.clone();
+                let handle = std::thread::spawn(move || {
+                    while let Ok(segment) = seg_rx.recv() {
+                        match tm_bg.transcribe(segment) {
+                            Ok(text) if !text.trim().is_empty() => {
+                                rm_bg.append_partial_transcription(&text);
+                                let partial = rm_bg.get_partial_transcription();
+                                let _ = app_bg.emit("partial-transcription", partial);
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+                rm.set_segment_task_handle(handle);
+            }
+
             // Dynamically register the cancel shortcut in a separate task to avoid deadlock
             shortcut::register_cancel_shortcut(app);
         } else {
@@ -521,31 +554,43 @@ impl ShortcutAction for TranscribeAction {
             );
 
             let stop_recording_time = Instant::now();
-            if let Some(samples) = rm.stop_recording(&binding_id) {
+            if let Some((all_samples, emitted_count)) = rm.stop_recording(&binding_id) {
                 debug!(
-                    "Recording stopped and samples retrieved in {:?}, sample count: {}",
+                    "Recording stopped and samples retrieved in {:?}, sample count: {}, already emitted: {}",
                     stop_recording_time.elapsed(),
-                    samples.len()
+                    all_samples.len(),
+                    emitted_count,
                 );
 
-                if samples.is_empty() {
+                if all_samples.is_empty() {
                     debug!("Recording produced no audio samples; skipping persistence");
+                    rm.join_segment_task();
+                    rm.clear_partial_transcription();
                     utils::hide_recording_overlay(&ah);
                     change_tray_icon(&ah, TrayIconState::Idle);
                 } else {
-                    // Save WAV concurrently with transcription
-                    let sample_count = samples.len();
+                    // Save WAV from all captured speech (start concurrently)
+                    let sample_count = all_samples.len();
                     let file_name = format!("handy-{}.wav", chrono::Utc::now().timestamp());
                     let wav_path = hm.recordings_dir().join(&file_name);
                     let wav_path_for_verify = wav_path.clone();
-                    let samples_for_wav = samples.clone();
+                    let samples_for_wav = all_samples.clone();
                     let wav_handle = tauri::async_runtime::spawn_blocking(move || {
                         crate::audio_toolkit::save_wav_file(&wav_path, &samples_for_wav)
                     });
 
-                    // Transcribe concurrently with WAV save
+                    // Wait for the background segment task to drain (transcribes any
+                    // queued segments; the audio worker already dropped the sender on Stop).
+                    rm.join_segment_task();
+                    let partial = rm.get_partial_transcription();
+                    rm.clear_partial_transcription();
+
+                    // Transcribe only the tail: audio since the last emitted segment.
+                    let tail = all_samples[emitted_count..].to_vec();
                     let transcription_time = Instant::now();
-                    let transcription_result = tm.transcribe(samples);
+                    let transcription_result = tm.transcribe(tail).map(|tail_text| {
+                        combine_transcriptions(&partial, &tail_text)
+                    });
 
                     // Await WAV save and verify
                     let wav_saved = match wav_handle.await {

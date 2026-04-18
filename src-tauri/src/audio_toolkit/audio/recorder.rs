@@ -21,7 +21,8 @@ use crate::audio_toolkit::{
 
 enum Cmd {
     Start,
-    Stop(mpsc::Sender<Vec<f32>>),
+    Stop(mpsc::Sender<(Vec<f32>, usize)>),
+    SetSegmentSender(Option<mpsc::SyncSender<Vec<f32>>>),
     Shutdown,
 }
 
@@ -159,7 +160,7 @@ impl AudioRecorder {
                 Ok((stream, sample_rate)) => {
                     let _ = init_tx.send(Ok(()));
                     // Keep the stream alive while we process samples.
-                    run_consumer(sample_rate, vad, sample_rx, cmd_rx, level_cb, stop_flag);
+                    run_consumer(sample_rate, vad, sample_rx, cmd_rx, level_cb, stop_flag, None);
                     drop(stream);
                 }
                 Err(error_message) => {
@@ -202,12 +203,25 @@ impl AudioRecorder {
         Ok(())
     }
 
-    pub fn stop(&self) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-        let (resp_tx, resp_rx) = mpsc::channel();
+    pub fn stop(&self) -> Result<(Vec<f32>, usize), Box<dyn std::error::Error>> {
+        let (resp_tx, resp_rx) = mpsc::channel::<(Vec<f32>, usize)>();
         if let Some(tx) = &self.cmd_tx {
             tx.send(Cmd::Stop(resp_tx))?;
         }
         Ok(resp_rx.recv()?) // wait for the samples
+    }
+
+    /// Send a segment sender to the worker thread. Call with `Some(tx)` when
+    /// starting a new recording to enable live segment transcription, and the
+    /// worker will automatically clear it (set to `None`) on `Cmd::Stop`.
+    pub fn set_segment_sender(
+        &self,
+        tx: Option<mpsc::SyncSender<Vec<f32>>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(cmd_tx) = &self.cmd_tx {
+            cmd_tx.send(Cmd::SetSegmentSender(tx))?;
+        }
+        Ok(())
     }
 
     pub fn close(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -399,6 +413,7 @@ fn run_consumer(
     cmd_rx: mpsc::Receiver<Cmd>,
     level_cb: Option<Arc<dyn Fn(Vec<f32>) + Send + Sync + 'static>>,
     stop_flag: Arc<AtomicBool>,
+    mut segment_tx: Option<mpsc::SyncSender<Vec<f32>>>,
 ) {
     let mut frame_resampler = FrameResampler::new(
         in_sample_rate as usize,
@@ -408,6 +423,11 @@ fn run_consumer(
 
     let mut processed_samples = Vec::<f32>::new();
     let mut recording = false;
+
+    // Segment tracking: index into processed_samples up to which segments have
+    // already been emitted via segment_tx for live transcription.
+    let mut segment_start_idx: usize = 0;
+    let mut in_speech_segment = false;
 
     // ---------- spectrum visualisation setup ---------------------------- //
     const BUCKETS: usize = 16;
@@ -420,6 +440,7 @@ fn run_consumer(
         4000.0, // vocal_max_hz
     );
 
+    // Used for the stop-drain path where segment detection is not needed.
     fn handle_frame(
         samples: &[f32],
         recording: bool,
@@ -459,9 +480,37 @@ fn run_consumer(
             }
         }
 
-        // ---------- existing pipeline ------------------------------------ //
+        // ---------- main pipeline with live-segment detection ------------ //
         frame_resampler.push(&raw, &mut |frame: &[f32]| {
-            handle_frame(frame, recording, &vad, &mut processed_samples)
+            if !recording {
+                return;
+            }
+            if let Some(vad_arc) = &vad {
+                let mut det = vad_arc.lock().unwrap();
+                match det.push_frame(frame).unwrap_or(VadFrame::Speech(frame)) {
+                    VadFrame::Speech(buf) => {
+                        processed_samples.extend_from_slice(buf);
+                        in_speech_segment = true;
+                    }
+                    VadFrame::Noise => {
+                        if in_speech_segment {
+                            // Speech → silence transition: emit the completed segment.
+                            let seg = processed_samples[segment_start_idx..].to_vec();
+                            if !seg.is_empty() {
+                                if let Some(tx) = &segment_tx {
+                                    // Non-blocking: drop segment if receiver is gone or buffer full.
+                                    let _ = tx.try_send(seg);
+                                }
+                                segment_start_idx = processed_samples.len();
+                            }
+                            in_speech_segment = false;
+                        }
+                    }
+                }
+            } else {
+                processed_samples.extend_from_slice(frame);
+                in_speech_segment = true;
+            }
         });
 
         // non-blocking check for a command
@@ -471,10 +520,15 @@ fn run_consumer(
                     stop_flag.store(false, Ordering::Relaxed);
                     processed_samples.clear();
                     recording = true;
+                    in_speech_segment = false;
+                    segment_start_idx = 0;
                     visualizer.reset();
                     if let Some(v) = &vad {
                         v.lock().unwrap().reset();
                     }
+                }
+                Cmd::SetSegmentSender(tx) => {
+                    segment_tx = tx;
                 }
                 Cmd::Stop(reply_tx) => {
                     recording = false;
@@ -503,7 +557,15 @@ fn run_consumer(
                         handle_frame(frame, true, &vad, &mut processed_samples)
                     });
 
-                    let _ = reply_tx.send(std::mem::take(&mut processed_samples));
+                    let emitted_count = segment_start_idx;
+                    let all_samples = std::mem::take(&mut processed_samples);
+                    let _ = reply_tx.send((all_samples, emitted_count));
+
+                    // Drop the segment sender so the background transcription task
+                    // can detect the end of this recording and exit cleanly.
+                    segment_tx = None;
+                    in_speech_segment = false;
+                    segment_start_idx = 0;
 
                     // Resume the audio callback so the consumer loop can continue
                     // receiving chunks (important for always-on microphone mode).

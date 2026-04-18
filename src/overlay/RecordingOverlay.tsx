@@ -12,30 +12,49 @@ import i18n, { syncLanguageFromSettings } from "@/i18n";
 import { getLanguageDirection } from "@/lib/utils/rtl";
 
 type OverlayState = "recording" | "transcribing" | "processing";
+type OverlayPosition = "top" | "bottom";
+
+interface ShowOverlayPayload {
+  state: OverlayState;
+  position: OverlayPosition;
+}
 
 const RecordingOverlay: React.FC = () => {
   const { t } = useTranslation();
   const [isVisible, setIsVisible] = useState(false);
   const [state, setState] = useState<OverlayState>("recording");
+  const [overlayPosition, setOverlayPosition] = useState<OverlayPosition>("bottom");
   const [levels, setLevels] = useState<number[]>(Array(16).fill(0));
+  const [partialText, setPartialText] = useState<string>("");
   const smoothedLevelsRef = useRef<number[]>(Array(16).fill(0));
   const direction = getLanguageDirection(i18n.language);
 
   useEffect(() => {
     const setupEventListeners = async () => {
       // Listen for show-overlay event from Rust
-      const unlistenShow = await listen("show-overlay", async (event) => {
-        // Sync language from settings each time overlay is shown
-        await syncLanguageFromSettings();
-        const overlayState = event.payload as OverlayState;
-        setState(overlayState);
-        setIsVisible(true);
-      });
+      const unlistenShow = await listen<ShowOverlayPayload>(
+        "show-overlay",
+        async (event) => {
+          await syncLanguageFromSettings();
+          setState(event.payload.state);
+          setOverlayPosition(event.payload.position ?? "bottom");
+          setIsVisible(true);
+        },
+      );
 
       // Listen for hide-overlay event from Rust
       const unlistenHide = await listen("hide-overlay", () => {
         setIsVisible(false);
+        setPartialText("");
       });
+
+      // Listen for live partial transcription updates during recording
+      const unlistenPartial = await listen<string>(
+        "partial-transcription",
+        (event) => {
+          setPartialText(event.payload);
+        },
+      );
 
       // Listen for mic-level updates
       const unlistenLevel = await listen<number[]>("mic-level", (event) => {
@@ -44,7 +63,7 @@ const RecordingOverlay: React.FC = () => {
         // Apply smoothing to reduce jitter
         const smoothed = smoothedLevelsRef.current.map((prev, i) => {
           const target = newLevels[i] || 0;
-          return prev * 0.7 + target * 0.3; // Smooth transition
+          return prev * 0.7 + target * 0.3;
         });
 
         smoothedLevelsRef.current = smoothed;
@@ -55,6 +74,7 @@ const RecordingOverlay: React.FC = () => {
       return () => {
         unlistenShow();
         unlistenHide();
+        unlistenPartial();
         unlistenLevel();
       };
     };
@@ -70,11 +90,8 @@ const RecordingOverlay: React.FC = () => {
     }
   };
 
-  return (
-    <div
-      dir={direction}
-      className={`recording-overlay ${isVisible ? "fade-in" : ""}`}
-    >
+  const indicator = (
+    <div className="recording-overlay">
       <div className="overlay-left">{getIcon()}</div>
 
       <div className="overlay-middle">
@@ -85,9 +102,9 @@ const RecordingOverlay: React.FC = () => {
                 key={i}
                 className="bar"
                 style={{
-                  height: `${Math.min(20, 4 + Math.pow(v, 0.7) * 16)}px`, // Cap at 20px max height
+                  height: `${Math.min(20, 4 + Math.pow(v, 0.7) * 16)}px`,
                   transition: "height 60ms ease-out, opacity 120ms ease-out",
-                  opacity: Math.max(0.2, v * 1.7), // Minimum opacity for visibility
+                  opacity: Math.max(0.2, v * 1.7),
                 }}
               />
             ))}
@@ -113,6 +130,29 @@ const RecordingOverlay: React.FC = () => {
           </div>
         )}
       </div>
+    </div>
+  );
+
+  const bubble = partialText ? (
+    <div className="transcription-bubble">{partialText}</div>
+  ) : null;
+
+  return (
+    <div
+      dir={direction}
+      className={`overlay-root overlay-root--${overlayPosition} ${isVisible ? "overlay-root--visible" : ""}`}
+    >
+      {overlayPosition === "top" ? (
+        <>
+          {indicator}
+          {bubble}
+        </>
+      ) : (
+        <>
+          {bubble}
+          {indicator}
+        </>
+      )}
     </div>
   );
 };
